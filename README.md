@@ -22,8 +22,8 @@ resulting DOM, and how fast and how cheaply does it do that.
 
 ## Results
 
-Latest full pass: 2026-06-04, on a 10-core host. Conformance numbers are from
-the `feat/wpt-conformance-4` build; rerun the suites to refresh.
+Latest full pass: 2026-07-03, on a 10-core host, against the current `main`
+build (commit `b5039a8`); rerun the suites to refresh.
 
 ### Web Platform Tests (conformance)
 
@@ -34,9 +34,9 @@ conformance measure:
 
 | tier | subtests passing | role |
 | ---- | ---------------- | ---- |
-| Core | 321,042 / 393,513 (**81.6%**) | the DOM/HTML/URL/fetch scraping contract |
-| Relevant | 513,559 / 599,962 (**85.6%**) | Core plus broader JS-observable correctness |
-| Full | 583,813 / 929,308 (62.8%) | the whole suite, for transparency |
+| Core | 318,916 / 382,891 (**83.3%**) | the DOM/HTML/URL/fetch scraping contract |
+| Relevant | 420,319 / 494,422 (**85.0%**) | Core plus broader JS-observable correctness |
+| Full | 503,413 / 839,489 (60.0%) | the whole suite, for transparency |
 
 Core subtest pass rate over time:
 
@@ -45,7 +45,8 @@ Core subtest pass rate over time:
 | 2026-06-03 | baseline | 8.0% |
 | 2026-06-04 | round 2 | 15.4% |
 | 2026-06-04 | + charset/URL encoding | 72.7% |
-| 2026-06-04 | + IDL reflection, attr folding, storage | **81.6%** |
+| 2026-06-04 | + IDL reflection, attr folding, storage | 81.6% |
+| 2026-07-03 | current main | **83.3%** |
 
 The "Full" tier includes large subtrees Obscura intentionally does not implement
 (layout, rendering, media, hardware), so it is reported only for transparency.
@@ -56,7 +57,7 @@ are published on [wpt.fyi](https://wpt.fyi/).
 
 ### Obstacle course (capability + speed)
 
-33 / 33 stages pass, median ~32 ms per stage (cold `obscura fetch`, including
+33 / 33 stages pass, median ~44 ms per stage (cold `obscura fetch`, including
 process startup). Covers client-side React/Preact/Vue, SSR hydration, ES modules
 and dynamic import, IntersectionObserver/MutationObserver, `fetch` + pushState
 SPAs, the URL/TextDecoder/FileAPI/Range/Selection/custom-element/dialog web-API
@@ -71,12 +72,12 @@ are not in the shipped HTML):
 
 | page | obscura | headless Chrome | obscura advantage |
 | ---- | ------- | --------------- | ----------------- |
-| react | 88 ms, 30 MB | 1097 ms, 185 MB | 12x faster, 6x less memory |
-| preact | 59 ms, 29 MB | 1032 ms, 186 MB | 18x faster, 6x less memory |
-| vue | 97 ms, 32 MB | 1144 ms, 184 MB | 12x faster, 6x less memory |
+| react | 81 ms, 30 MB | 815 ms, 190 MB | 10x faster, 6x less memory |
+| preact | 45 ms, 30 MB | 745 ms, 191 MB | 16x faster, 6x less memory |
+| vue | 86 ms, 31 MB | 796 ms, 190 MB | 9x faster, 6x less memory |
 
-Across all 33 obstacle-course fixtures the median is ~23x faster and ~7x less
-memory (obscura ~27 MB vs Chrome ~185 MB per process). The framework rows above
+Across all 33 obstacle-course fixtures the median is ~21x faster and ~7x less
+memory (obscura ~27 MB vs Chrome ~190 MB per process). The framework rows above
 are the heaviest-render, most conservative cases; lighter pages widen the gap
 because Chrome pays the same fixed startup regardless of the page.
 
@@ -84,8 +85,8 @@ Throughput and memory as concurrency rises (24 React-app loads, idle host):
 
 | engine | 1 worker | 4 workers | 8 workers |
 | ------ | -------- | --------- | --------- |
-| obscura | 11 pg/s, 29 MB | **39 pg/s, 113 MB** | 21 pg/s, 132 MB |
-| headless Chrome | 1.1 pg/s, 1.1 GB | 2.7 pg/s, 4.2 GB | 2.8 pg/s, **7.1 GB** |
+| obscura | 12 pg/s, 30 MB | **40 pg/s, 112 MB** | 18 pg/s, 159 MB |
+| headless Chrome | 1.2 pg/s, 1.1 GB | 3.0 pg/s, 4.2 GB | 3.0 pg/s, **8.1 GB** |
 
 Obscura sustains far higher throughput at a fraction of the memory. Chrome pays
 a large fixed startup (process + browser stack) on every page; under concurrency
@@ -96,20 +97,19 @@ case).
 
 ### Real-world corpus (vs headless Chrome)
 
-24 live public pages, fetched with obscura and headless Chrome side by side:
+98 live public pages, fetched with obscura and headless Chrome side by side:
 
 | engine | rendered | median latency | median peak RSS |
 | ------ | -------- | -------------- | --------------- |
-| obscura | 22 / 24 (91.7%) | 2.0 s | **35.6 MB** |
-| headless Chrome | 22 / 24 (91.7%) | 1.5 s | 191.8 MB |
+| obscura | 94 / 98 (95.9%) | 5.2 s | **64.2 MB** |
+| headless Chrome | 85 / 98 (86.7%) | 2.1 s | 201.2 MB |
 
-Same render-success rate, including the client-rendered SPAs (react.dev,
-vuejs.org, svelte.dev, angular.dev, remix.run). Obscura uses ~5x less memory on
-every page. Latency is mixed: obscura is much faster on content pages (example.com
-63 ms vs 940 ms, Wikipedia 180 ms vs 1.5 s) and slower on heavy client-rendered
-SPAs (angular.dev 15 s vs 3 s), where its settle wait dominates. Obscura rendered
-github.com where Chrome timed out; Chrome rendered solidjs.com where obscura did
-not. The live web drifts, so these are a snapshot; see `realworld/sites.txt`.
+Obscura renders more of the corpus than headless Chrome (94 vs 85), and at ~3x
+less memory. Chrome's misses are mostly sites that serve a datacenter IP an
+anti-bot or CAPTCHA wall, which is not an engine failure on either side. Latency
+is mixed: obscura is much faster on static content pages and slower on heavy
+client-rendered SPAs, where its post-load settle wait (`--wait`) dominates the
+median. The live web drifts, so these are a snapshot; see `realworld/sites.txt`.
 
 ### Reliability (crash / hang sweep)
 
@@ -119,17 +119,17 @@ rendered through obscura, classifying each outcome from the exit code and stderr
 
 | outcome | count |
 | ------- | ----- |
-| rendered | 1438 / 1500 (95.9%) |
-| thin / blocked | 58 |
-| bounded hang (deadline) | 4 |
+| rendered | 1432 / 1500 (95.5%) |
+| thin / blocked | 67 |
+| bounded hang (deadline) | 1 |
 | **crash (signal)** | **0** |
 | **panic** | **0** |
 
 Zero crashes and zero panics across 1500 diverse pages. Any page that does not
 finish in its budget is terminated deterministically (a V8 termination watchdog
-plus a process-level hard deadline), so no page can wedge a worker. The four
-bounded hangs are heavy SPAs that exceed the tight per-page budget under 12-way
-concurrency; each renders normally when run on its own. Run it with
+plus a process-level hard deadline), so no page can wedge a worker. The single
+bounded hang (kayak.com) is a heavy page that exceeds the tight per-page budget
+under concurrency; it renders normally when run on its own. Run it with
 `OBSCURA_BIN=<bin> python3 reliability/sweep.py`.
 
 ## 1. WPT conformance
