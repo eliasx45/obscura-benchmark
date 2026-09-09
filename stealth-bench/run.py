@@ -7,8 +7,8 @@ No outbound network requests are made.
 Covers:
   navigator identity, anti-detection markers, per-page randomization pools,
   internal consistency, plugins / MIME stubs, userAgentData, HTTP request
-  headers, WebGL spoofing, battery / storage / permissions APIs, profile
-  pinning (all 8 profiles), OBSCURA_GEOLOCATION env var, and stealth mode.
+  headers, WebGL spoofing, battery / storage / permissions APIs, the default
+  Windows Chrome 149 identity, OBSCURA_GEOLOCATION, and stealth mode.
 
 Usage:
   OBSCURA_BIN=/tmp/obscura-bench  python3 stealth-bench/run.py
@@ -27,35 +27,25 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 RESULTS_DIR = os.path.join(HERE, "..", "results")
 
 # ============================================================
-# Known pool / constant values from bootstrap.js / profiles.rs
+# Known pool / constant values from bootstrap.js and the browser identity
 # ============================================================
 SCREEN_POOL = [(1920,1080),(2560,1440),(1366,768),(1536,864),
                (1440,900),(1680,1050),(1280,720),(3840,2160)]
 HW_POOL = {2, 4, 6, 8, 12, 16}
 MEM_POOL = {0.25, 0.5, 1, 2, 4, 8}
 
-PROFILES = [
-    # (chrome_version, platform, ua_platform, ua_platform_version, os_label)
-    ("143", "Win32", "Windows", "10.0.0",  "Win10"),
-    ("144", "Win32", "Windows", "10.0.0",  "Win10"),
-    ("145", "Win32", "Windows", "15.0.0",  "Win11"),
-    ("146", "Win32", "Windows", "15.0.0",  "Win11"),
-    ("143", "MacIntel", "macOS", "13.6.7", "macOS14"),
-    ("144", "MacIntel", "macOS", "14.4.1", "macOS14"),
-    ("145", "MacIntel", "macOS", "14.5.0", "macOS14"),
-    ("146", "MacIntel", "macOS", "14.6.0", "macOS14"),
-]
-
-STEALTH_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-              "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36")
+DEFAULT_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36")
+DEFAULT_PLATFORM = "Win32"
+DEFAULT_UA_PLATFORM = "Windows"
+DEFAULT_UA_PLATFORM_VERSION = "15.0.0"
+STEALTH_UA = DEFAULT_UA
+DEFAULT_JS_HEAP_SIZE_LIMIT = 4_294_705_152
 
 PLUGIN_NAMES = {
     "PDF Viewer", "Chrome PDF Viewer", "Chromium PDF Viewer",
     "Microsoft Edge PDF Viewer", "WebKit built-in PDF",
 }
-
-WIN_GPU_VENDORS = {"Google Inc. (NVIDIA)", "Google Inc. (Intel)", "Google Inc. (AMD)"}
-MAC_GPU_VENDORS = {"Google Inc. (Apple)", "Google Inc. (Intel Inc.)"}
 
 # ============================================================
 # Local fixture HTTP server
@@ -631,8 +621,8 @@ def run_all(stealth_mode, filter_str):
             heap_total = d.get("totalJSHeapSize")
             heap_used = d.get("usedJSHeapSize")
             check("cons_heap_size_limit_correct", "consistency",
-                  heap_limit == 2172649472,
-                  expected=2172649472, actual=heap_limit)
+                  heap_limit == DEFAULT_JS_HEAP_SIZE_LIMIT,
+                  expected=DEFAULT_JS_HEAP_SIZE_LIMIT, actual=heap_limit)
             check("cons_heap_ordering", "consistency",
                   all(v is not None for v in [heap_used, heap_total, heap_limit])
                   and heap_used <= heap_total <= heap_limit,
@@ -659,16 +649,15 @@ def run_all(stealth_mode, filter_str):
                   expected=False, actual=uad_mobile)
             uad_plat = d.get("uadPlatform") or ""
             ua_str = d.get("uaString") or ""
-            if stealth_mode:
-                check("cons_stealth_ua_linux", "consistency",
-                      "Linux" in ua_str and "X11" in ua_str,
-                      detail="stealth mode uses Linux Chrome 145 UA",
-                      expected="Linux/X11 in UA", actual=ua_str[:80])
-            else:
-                check("cons_ua_has_platform_hint", "consistency",
-                      ("Windows" in ua_str or "Macintosh" in ua_str),
-                      detail="profile UA must include Windows or Macintosh",
-                      actual=ua_str[:80])
+            check("cons_ua_is_default_windows_chrome149", "consistency",
+                  ua_str == DEFAULT_UA,
+                  expected=DEFAULT_UA, actual=ua_str)
+            check("cons_platform_is_windows", "consistency",
+                  d.get("platform") == DEFAULT_PLATFORM,
+                  expected=DEFAULT_PLATFORM, actual=d.get("platform"))
+            check("cons_uad_platform_is_windows", "consistency",
+                  uad_plat == DEFAULT_UA_PLATFORM,
+                  expected=DEFAULT_UA_PLATFORM, actual=uad_plat)
 
     # ------------------------------------------------------------------
     # 6. Plugins and MIME types
@@ -927,41 +916,7 @@ def run_all(stealth_mode, filter_str):
                   expected=">=3", actual=d.get("deviceCount"))
 
     # ------------------------------------------------------------------
-    # 15. Profile pinning (all 8 profiles)
-    # ------------------------------------------------------------------
-    if not skip("profile"):
-        for idx, (chrome_ver, platform, ua_plat, ua_plat_ver, label) in enumerate(PROFILES):
-            env = {"OBSCURA_PROFILE": str(idx)}
-            d, err = r("nav-identity", env=env)
-            if err:
-                check("profile_%d_%s_load" % (idx, label), "profile-pin", False, err)
-                continue
-            ua = d.get("userAgent", "")
-            plat = d.get("platform", "")
-            if stealth_mode:
-                # Stealth mode locks navigator.userAgent to STEALTH_USER_AGENT regardless
-                # of profile. Platform is now also overridden to Linux.
-                check("profile_%d_ua_is_stealth" % idx, "profile-pin",
-                      ua == STEALTH_UA,
-                      detail="stealth overrides profile UA (profile %d %s)" % (idx, label),
-                      expected=STEALTH_UA[:60], actual=ua[:60])
-                check("profile_%d_platform_linux" % idx, "profile-pin",
-                      plat == "Linux x86_64",
-                      detail="stealth overrides platform to Linux x86_64",
-                      expected="Linux x86_64", actual=plat)
-            else:
-                check("profile_%d_chrome_version" % idx, "profile-pin",
-                      ("Chrome/%s.0.0.0" % chrome_ver) in ua,
-                      expected="Chrome/%s.0.0.0" % chrome_ver, actual=ua[:80])
-                check("profile_%d_platform" % idx, "profile-pin",
-                      plat == platform,
-                      expected=platform, actual=plat)
-                check("profile_%d_uad_platform" % idx, "profile-pin",
-                      True,
-                      detail="profile %d (%s) UA verified" % (idx, label))
-
-    # ------------------------------------------------------------------
-    # 16. Stealth mode UA consistency
+    # 15. Stealth mode UA consistency
     # ------------------------------------------------------------------
     if not skip("stealth") and stealth_mode:
         d, err = r("nav-identity")
@@ -977,19 +932,12 @@ def run_all(stealth_mode, filter_str):
                   hdr.get("user-agent") == STEALTH_UA,
                   detail="stealth HTTP User-Agent must match STEALTH_USER_AGENT",
                   expected=STEALTH_UA, actual=hdr.get("user-agent", "")[:80])
-            # Known gap: platform says Win32 but UA says Linux
             if d:
                 nav_ua = d.get("userAgent", "")
                 nav_plat = d.get("platform", "")
-                consistent_platform = (
-                    ("Linux" in nav_ua and nav_plat == "Win32") is False
-                    or True  # document the known gap, not a hard fail
-                )
-                # This is informational - flag the gap without failing
                 check("stealth_ua_platform_consistency", "stealth-mode",
-                      not ("Linux" in nav_ua and nav_plat == "Win32"),
-                      detail="KNOWN GAP: with --stealth, UA is Linux but platform may be "
-                             "Win32 (profile 0 default). navigator.platform should match UA OS.",
+                      nav_ua == DEFAULT_UA and nav_plat == DEFAULT_PLATFORM,
+                      detail="stealth transport and page identity must share Windows Chrome 149",
                       expected="platform consistent with UA",
                       actual="UA=%s, platform=%s" % (nav_ua[:40], nav_plat))
 
@@ -1028,17 +976,7 @@ def main():
     ap.add_argument("--json", action="store_true", help="output JSON report")
     ap.add_argument("--filter", default="",
                     help="run only categories matching this substring")
-    ap.add_argument("--no-profiles", action="store_true",
-                    help="skip the 8-profile pin tests (faster)")
     args = ap.parse_args()
-
-    if args.no_profiles:
-        filter_combined = args.filter
-        original_run = run_all
-        def _run_no_profiles(stealth, filt):
-            return original_run(stealth, filt + " -profile" if "profile" not in filt else filt)
-    else:
-        pass
 
     if not args.json:
         mode = "(--stealth)" if args.stealth else "(no stealth)"
