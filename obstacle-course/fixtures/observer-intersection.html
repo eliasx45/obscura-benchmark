@@ -1,21 +1,27 @@
 <!doctype html>
 <html lang="en">
 <head><meta charset="utf-8"><title>IntersectionObserver Infinite Scroll</title></head>
+<style>
+  /* Make one batch move the sentinel outside the viewport. The fixture then
+     scrolls it back into view, which creates real false -> true crossings. */
+  #feed .card { height: 100px; }
+</style>
 <body>
   <div id="feed"></div>
   <div id="sentinel"></div>
   <!-- Infinite-scroll / lazy-load pattern: an IntersectionObserver watches a
        sentinel at the end of the feed. Each time the sentinel intersects the
-       viewport, a batch of items is appended and a new sentinel observed. This
-       is the core Next.js / React feed loading pattern. Headless tools without a
-       real layout/observer pipeline never fire the callback and load 0 items.
-       obscura treats observed targets as intersecting so the callback fires. -->
+       viewport, a batch of items is appended and the simulated user scrolls
+       farther down. This creates the same false -> true crossings as a real
+       infinite-scroll session. Headless tools without a real layout/observer
+       pipeline never fire the callback and load 0 items. -->
   <script>
     (function () {
       var feed = document.getElementById('feed');
       var loaded = 0;
       var BATCH = 10;
       var MAX = 50;
+      var sentinel = document.getElementById('sentinel');
 
       function appendBatch() {
         for (var i = 0; i < BATCH; i++) {
@@ -34,12 +40,20 @@
             if (loaded >= MAX) {
               io.disconnect();
               window.__obstacle = 'io:' + feed.querySelectorAll('.card').length;
+            } else {
+              // Let the post-mutation rendering opportunity observe the
+              // sentinel as non-intersecting before the next scroll crosses
+              // it back into the viewport.
+              setTimeout(function () {
+                var rect = sentinel.getBoundingClientRect();
+                window.scrollTo(0, (window.scrollY || 0) + rect.top);
+              }, 32);
             }
           }
         }
       });
 
-      io.observe(document.getElementById('sentinel'));
+      io.observe(sentinel);
     })();
   </script>
 </body>
