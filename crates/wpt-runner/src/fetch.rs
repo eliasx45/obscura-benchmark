@@ -1,11 +1,7 @@
 //! Fetch backend: run one `obscura fetch` process per test.
 //!
-//! The CDP `serve` path does not execute external `<script src>` subresources
-//! (it routes navigation through the fetch-interception machinery), so the WPT
-//! harness never loads over CDP. `obscura fetch` uses the direct navigation path
-//! that does load and run external scripts and settles the page, so we drive it
-//! per test and read the result the report overlay leaves on
-//! `window.__wptresults_json`.
+//! The no-render profile drives one isolated process per test and reads the
+//! result the report overlay leaves on `window.__wptresults_json`.
 
 use std::time::{Duration, Instant};
 
@@ -78,7 +74,11 @@ pub async fn run_fetch(
 
 fn strings(v: Option<&Value>) -> Vec<String> {
     v.and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default()
 }
 

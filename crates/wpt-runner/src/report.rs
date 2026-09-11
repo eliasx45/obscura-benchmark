@@ -1,18 +1,13 @@
-//! Result aggregation and output formatting.
+//! Result aggregation and the stable JSON contract consumed by `triage`.
 //!
-//! testharness.js status codes:
-//!   harness: 0 OK, 1 ERROR, 2 TIMEOUT, 3 PRECONDITION_FAILED
-//!   subtest: 0 PASS, 1 FAIL, 2 TIMEOUT, 3 NOTRUN, 4 PRECONDITION_FAILED
-//! Plus two runner-side codes: -1 no result before timeout, -2 runner error.
-//!
-//! Every `FileResult` also carries the console output and uncaught exceptions
-//! captured during the run. The `--json` output is the input contract for the
-//! `triage` bug catcher, so keep the shape stable.
+//! testharness.js uses harness status 0 for OK and 1..3 for failures. Runner
+//! statuses are -1 timeout, -2 error, and -3 explicitly unsupported.
 
+use serde::Serialize;
 use serde_json::{json, Value};
 use std::time::Duration;
 
-use crate::manifest::TestCase;
+use crate::manifest::{Fuzzy, TestCase, TestType};
 
 pub struct Subtest {
     pub name: String,
@@ -21,72 +16,113 @@ pub struct Subtest {
     pub stack: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct Comparison {
+    pub reference: String,
+    pub relation: String,
+    pub fuzzy: Fuzzy,
+    pub equal: bool,
+    pub max_difference: u64,
+    pub different_pixels: u64,
+    pub passed: bool,
+}
+
 pub struct FileResult {
+    pub test_type: TestType,
     pub path: String,
     pub url: String,
     pub harness_status: i64,
     pub harness_message: Option<String>,
     pub error: Option<String>,
     pub subtests: Vec<Subtest>,
-    /// Console output captured during the run (console.* and Log entries).
+    pub comparisons: Vec<Comparison>,
     pub console: Vec<String>,
-    /// Uncaught exceptions captured during the run (Runtime.exceptionThrown).
     pub exceptions: Vec<String>,
     pub duration_ms: u64,
 }
 
 impl FileResult {
-    pub fn from_payload(tc: &TestCase, p: Value) -> Self {
-        let harness_status = p.pointer("/harness/status").and_then(Value::as_i64).unwrap_or(1);
-        let harness_message = p
+    pub fn from_payload(tc: &TestCase, payload: Value) -> Self {
+        let harness_status = payload
+            .pointer("/harness/status")
+            .and_then(Value::as_i64)
+            .unwrap_or(1);
+        let harness_message = payload
             .pointer("/harness/message")
             .and_then(Value::as_str)
             .map(str::to_string);
-        let subtests = p
+        let subtests = payload
             .get("tests")
             .and_then(Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .map(|t| Subtest {
-                        name: t.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
-                        status: t.get("status").and_then(Value::as_i64).unwrap_or(1),
-                        message: t.get("message").and_then(Value::as_str).map(str::to_string),
-                        stack: t.get("stack").and_then(Value::as_str).map(str::to_string),
+            .map(|tests| {
+                tests
+                    .iter()
+                    .map(|test| Subtest {
+                        name: test
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        status: test.get("status").and_then(Value::as_i64).unwrap_or(1),
+                        message: test
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        stack: test
+                            .get("stack")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
                     })
                     .collect()
             })
             .unwrap_or_default();
-        FileResult {
+        Self {
+            test_type: tc.test_type,
             path: tc.path.clone(),
             url: tc.url.clone(),
             harness_status,
             harness_message,
             error: None,
             subtests,
+            comparisons: Vec::new(),
             console: Vec::new(),
             exceptions: Vec::new(),
             duration_ms: 0,
         }
     }
 
+    pub fn reftest(tc: &TestCase, passed: bool, comparisons: Vec<Comparison>) -> Self {
+        let mut result = Self::stub(tc, if passed { 0 } else { 1 }, "");
+        result.harness_message =
+            (!passed).then(|| "rendered output did not satisfy references".into());
+        result.comparisons = comparisons;
+        result
+    }
+
     pub fn timeout(tc: &TestCase) -> Self {
         Self::stub(tc, -1, "no result before timeout")
     }
 
-    pub fn runner_error(tc: &TestCase, msg: String) -> Self {
-        let mut r = Self::stub(tc, -2, "");
-        r.error = Some(msg);
-        r
+    pub fn runner_error(tc: &TestCase, message: String) -> Self {
+        let mut result = Self::stub(tc, -2, "");
+        result.error = Some(message);
+        result
     }
 
-    fn stub(tc: &TestCase, harness_status: i64, err: &str) -> Self {
-        FileResult {
+    pub fn unsupported(tc: &TestCase, reason: String) -> Self {
+        Self::stub(tc, -3, &reason)
+    }
+
+    fn stub(tc: &TestCase, harness_status: i64, error: &str) -> Self {
+        Self {
+            test_type: tc.test_type,
             path: tc.path.clone(),
             url: tc.url.clone(),
             harness_status,
             harness_message: None,
-            error: if err.is_empty() { None } else { Some(err.to_string()) },
+            error: (!error.is_empty()).then(|| error.to_string()),
             subtests: Vec::new(),
+            comparisons: Vec::new(),
             console: Vec::new(),
             exceptions: Vec::new(),
             duration_ms: 0,
@@ -94,27 +130,28 @@ impl FileResult {
     }
 
     pub fn pass(&self) -> usize {
-        self.subtests.iter().filter(|t| t.status == 0).count()
+        self.subtests.iter().filter(|test| test.status == 0).count()
     }
+
     pub fn total(&self) -> usize {
         self.subtests.len()
     }
-    /// A file is "ok" when the harness completed cleanly and every subtest passed.
+
     pub fn ok(&self) -> bool {
-        self.harness_status == 0 && self.subtests.iter().all(|t| t.status == 0)
+        self.harness_status == 0 && self.subtests.iter().all(|test| test.status == 0)
+    }
+
+    pub fn unsupported_status(&self) -> bool {
+        self.harness_status == -3
     }
 
     fn tag(&self) -> &'static str {
         match self.harness_status {
-            0 => {
-                if self.ok() {
-                    "OK  "
-                } else {
-                    "FAIL"
-                }
-            }
+            0 if self.ok() => "OK  ",
+            0 => "FAIL",
             -1 => "TMO ",
             -2 => "ERR ",
+            -3 => "UNSP",
             1 => "HERR",
             2 => "HTMO",
             3 => "PREC",
@@ -123,11 +160,27 @@ impl FileResult {
     }
 
     pub fn line(&self) -> String {
-        format!("{} {:>4}/{:<4} {}", self.tag(), self.pass(), self.total(), self.path)
+        if self.test_type == TestType::Reftest {
+            return format!(
+                "{} {:>4}/{:<4} {}",
+                self.tag(),
+                usize::from(self.ok()),
+                1,
+                self.path
+            );
+        }
+        format!(
+            "{} {:>4}/{:<4} {}",
+            self.tag(),
+            self.pass(),
+            self.total(),
+            self.path
+        )
     }
 
     fn to_json(&self) -> Value {
         json!({
+            "type": self.test_type.as_str(),
             "path": self.path,
             "url": self.url,
             "harness_status": self.harness_status,
@@ -139,11 +192,12 @@ impl FileResult {
             "error": self.error,
             "console": self.console,
             "exceptions": self.exceptions,
-            "subtests": self.subtests.iter().map(|t| json!({
-                "name": t.name,
-                "status": t.status,
-                "message": t.message,
-                "stack": t.stack,
+            "comparisons": self.comparisons,
+            "subtests": self.subtests.iter().map(|test| json!({
+                "name": test.name,
+                "status": test.status,
+                "message": test.message,
+                "stack": test.stack,
             })).collect::<Vec<_>>(),
         })
     }
@@ -153,68 +207,91 @@ pub struct Summary {
     pub files: usize,
     pub files_ok: usize,
     pub files_error: usize,
+    pub files_unsupported: usize,
     pub subtest_pass: usize,
     pub subtest_fail: usize,
     pub subtest_total: usize,
 }
 
 pub fn summarize(results: &[FileResult]) -> Summary {
-    let mut s = Summary {
+    let mut summary = Summary {
         files: results.len(),
         files_ok: 0,
         files_error: 0,
+        files_unsupported: 0,
         subtest_pass: 0,
         subtest_fail: 0,
         subtest_total: 0,
     };
-    for r in results {
-        if r.ok() {
-            s.files_ok += 1;
+    for result in results {
+        if result.ok() {
+            summary.files_ok += 1;
         }
-        if r.harness_status != 0 {
-            s.files_error += 1;
+        if result.unsupported_status() {
+            summary.files_unsupported += 1;
+        } else if result.harness_status != 0 {
+            summary.files_error += 1;
         }
-        s.subtest_pass += r.pass();
-        s.subtest_total += r.total();
-        s.subtest_fail += r.total() - r.pass();
+        summary.subtest_pass += result.pass();
+        summary.subtest_total += result.total();
+        summary.subtest_fail += result.total() - result.pass();
     }
-    s
+    summary
 }
 
-pub fn print_results(results: &[FileResult], elapsed: Duration, as_json: bool) {
-    let s = summarize(results);
+pub fn print_results(
+    results: &[FileResult],
+    elapsed: Duration,
+    as_json: bool,
+    profile: &str,
+    engine_version: &str,
+    wpt_revision: &str,
+) {
+    let summary = summarize(results);
     if as_json {
-        let out = json!({
+        let output = json!({
+            "schema_version": 2,
+            "profile": profile,
+            "engine_version": engine_version,
+            "wpt_revision": wpt_revision,
             "elapsed_ms": elapsed.as_millis() as u64,
             "summary": {
-                "files": s.files,
-                "files_ok": s.files_ok,
-                "files_error": s.files_error,
-                "subtest_pass": s.subtest_pass,
-                "subtest_fail": s.subtest_fail,
-                "subtest_total": s.subtest_total,
+                "files": summary.files,
+                "files_ok": summary.files_ok,
+                "files_error": summary.files_error,
+                "files_unsupported": summary.files_unsupported,
+                "subtest_pass": summary.subtest_pass,
+                "subtest_fail": summary.subtest_fail,
+                "subtest_total": summary.subtest_total,
             },
             "results": results.iter().map(FileResult::to_json).collect::<Vec<_>>(),
         });
-        println!("{}", serde_json::to_string_pretty(&out).unwrap());
+        println!("{}", serde_json::to_string_pretty(&output).unwrap());
         return;
     }
 
-    let pct = |n: usize, d: usize| if d == 0 { 100.0 } else { n as f64 * 100.0 / d as f64 };
+    let pct = |n: usize, d: usize| {
+        if d == 0 {
+            100.0
+        } else {
+            n as f64 * 100.0 / d as f64
+        }
+    };
     eprintln!("------------------------------------------------------------");
     eprintln!(
-        "files:    {}/{} ok ({:.1}%), {} with harness errors",
-        s.files_ok,
-        s.files,
-        pct(s.files_ok, s.files),
-        s.files_error
+        "files:    {}/{} ok ({:.1}%), {} errors, {} unsupported",
+        summary.files_ok,
+        summary.files,
+        pct(summary.files_ok, summary.files),
+        summary.files_error,
+        summary.files_unsupported,
     );
     eprintln!(
         "subtests: {}/{} pass ({:.1}%), {} fail",
-        s.subtest_pass,
-        s.subtest_total,
-        pct(s.subtest_pass, s.subtest_total),
-        s.subtest_fail
+        summary.subtest_pass,
+        summary.subtest_total,
+        pct(summary.subtest_pass, summary.subtest_total),
+        summary.subtest_fail,
     );
     eprintln!("elapsed:  {:.1}s", elapsed.as_secs_f64());
 }
