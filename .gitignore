@@ -1,5 +1,6 @@
 # build output
 /target
+/.bench-bin
 
 # the WPT checkout is large and reproducible from setup-wpt.sh
 /wpt

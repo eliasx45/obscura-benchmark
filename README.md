@@ -2,11 +2,9 @@
 
 Conformance, capability, and performance benchmarks for
 [Obscura](https://github.com/h4ckf0r0day/obscura), a headless browser engine
-written in Rust for web scraping and AI agent automation. Obscura runs real
-JavaScript on a V8 runtime and builds a live DOM, but has no rendering, layout,
-or paint pipeline. These benchmarks measure the part that matters for scraping
-and automation: does it load the page, run the scripts correctly, and expose the
-resulting DOM, and how fast and how cheaply does it do that.
+written in Rust for web scraping and AI agent automation. The benchmark keeps
+Obscura's fast DOM/JavaScript path and its optional rendering path separate, so
+rendering coverage cannot hide regressions in the classic scraping contract.
 
 ## Benchmark tracks
 
@@ -22,8 +20,9 @@ resulting DOM, and how fast and how cheaply does it do that.
 
 ## Results
 
-Latest full pass: 2026-07-03, on a 10-core host, against the current `main`
-build (commit `b5039a8`); rerun the suites to refresh.
+Latest published full pass is the historical 2026-07-03 no-render run, on a
+10-core host against Obscura commit `b5039a8`. It predates the rendering profile
+and must be rerun before being treated as a current result.
 
 ### Web Platform Tests (conformance)
 
@@ -48,12 +47,13 @@ Core subtest pass rate over time:
 | 2026-06-04 | + IDL reflection, attr folding, storage | 81.6% |
 | 2026-07-03 | current main | **83.3%** |
 
-The "Full" tier includes large subtrees Obscura intentionally does not implement
-(layout, rendering, media, hardware), so it is reported only for transparency.
-The Core and Relevant tiers are the headline because they exclude those by
-capability, not by outcome. See `crates/triage/src/tiers.list` for the exact
-rules. For cross-engine context, the same WPT areas for Chrome/Firefox/Safari
-are published on [wpt.fyi](https://wpt.fyi/).
+For this historical no-render result, the "Full" tier includes large subtrees
+outside that profile's scope (layout, rendering, media, and hardware), so it is
+reported only for transparency. Core and Relevant remain the no-render headline
+because they exclude those areas by capability, not by outcome. New rendering
+results are reported as a separate profile. See `crates/triage/src/tiers.list`
+for the exact rules. For cross-engine context, the same WPT areas for
+Chrome/Firefox/Safari are published on [wpt.fyi](https://wpt.fyi/).
 
 ### Obstacle course (capability + speed)
 
@@ -91,9 +91,8 @@ Throughput and memory as concurrency rises (24 React-app loads, idle host):
 Obscura sustains far higher throughput at a fraction of the memory. Chrome pays
 a large fixed startup (process + browser stack) on every page; under concurrency
 its RAM climbs into the gigabytes while Obscura stays in the low hundreds of MB.
-This is the scraping path only; Obscura does no rendering, and production Chrome
-would reuse one browser across tabs (the cold-process numbers are Chrome's worst
-case).
+This is the no-render scraping profile; production Chrome would reuse one browser
+across tabs (the cold-process numbers are Chrome's worst case).
 
 ### Real-world corpus (vs headless Chrome)
 
@@ -134,29 +133,61 @@ under concurrency; it renders normally when run on its own. Run it with
 
 ## 1. WPT conformance
 
-`crates/wpt-runner` drives Obscura's CLI: it serves the Web Platform Tests over
-the standard WPT server and runs one `obscura fetch` per test, reading the
-results that `wpt-overlay/resources/testharnessreport.js` leaves in the page.
-`crates/triage` then groups failures into deduplicated root causes and computes
-the per-tier pass rates.
+`crates/wpt-runner` has two explicit profiles:
+
+- `no-render` is the classic, primary conformance signal. It runs every supported
+  WPT testharness file through a separate `obscura fetch` process and reads the
+  result left by `wpt-overlay/resources/testharnessreport.js`.
+- `render` runs the same testharness corpus over CDP and adds WPT reftests. Each
+  reftest is captured at 800x600 and device scale factor 1, then compared as RGB
+  using the manifest's equality, mismatch, and fuzzy metadata.
+
+Tests requiring unimplemented runner automation (testdriver, PAC, or HTTP/3
+serving) are reported as unsupported, not as engine
+failures. `crates/triage` reports that count separately and groups real failures
+into deduplicated root causes.
 
 ```sh
-# one-time setup: clone WPT, install the report overlay, build the manifest
+# one-time setup: check out the revision in wpt-config/WPT_COMMIT,
+# install the report overlay, and build the manifest
 scripts/setup-wpt.sh
 # then add the WPT hostnames once (needs sudo), as printed by setup-wpt.sh:
 #   ( cd wpt && ./wpt make-hosts-file ) | sudo tee -a /etc/hosts
 
-# run a full pass (writes results/wpt-<stamp>.json and results/triage.md)
-OBSCURA_BIN=/path/to/obscura scripts/run-wpt.sh --concurrency 32 --wait-secs 15
+# classic WPT pass; this remains the headline scraping/conformance result
+WPT_PROFILE=no-render OBSCURA_BIN=/path/to/obscura-no-render \
+  scripts/run-wpt.sh --concurrency 32 --wait-secs 15
 
-# a subset, by path filter
-OBSCURA_BIN=/path/to/obscura scripts/run-wpt.sh dom/ url/ encoding/
+# rendering pass: the classic corpus plus screenshot reftests
+WPT_PROFILE=render OBSCURA_BIN=/path/to/obscura-render \
+  scripts/run-wpt.sh --concurrency 4
+
+# a subset, by one path substring
+WPT_PROFILE=no-render OBSCURA_BIN=/path/to/obscura-no-render \
+  scripts/run-wpt.sh FileAPI/url/
 ```
 
-A full pass is ~30k files and takes a few hours. Use a concurrency that does not
-oversubscribe the host: oversubscription makes per-test timeouts fire, which
-silently drops results and depresses the pass rate. The output is
-`results/triage.md` (the tier table plus the top error signatures by spec area).
+The no-render profile is roughly 38k test variants; render adds roughly 28k
+reftests at the current pin. Use a concurrency that does not oversubscribe the
+host: oversubscription makes per-test timeouts fire and depresses the pass rate.
+Outputs are profile-qualified under `results/`, including the JSON report and a
+triage Markdown report.
+
+Build separate Obscura binaries so the profiles cannot be mixed accidentally:
+
+```sh
+BENCH_BIN_DIR=/path/to/obscura-benchmark/.bench-bin
+mkdir -p "$BENCH_BIN_DIR"
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release \
+  -p obscura-cli --bins --no-default-features
+cp target/release/obscura "$BENCH_BIN_DIR/obscura-no-render"
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release \
+  -p obscura-cli --bins --no-default-features --features render
+cp target/release/obscura "$BENCH_BIN_DIR/obscura-render"
+```
+
+Run those build commands in the Obscura repository. Record its exact commit with
+the result commit; the WPT side is reproducibly pinned by this repository.
 
 ## 2. Obstacle course
 
@@ -218,7 +249,7 @@ OBSCURA_BIN=/path/to/obscura scripts/run-bench.sh https://example.com https://ne
 
 ```
 crates/
-  wpt-runner/      runs WPT against obscura (one `obscura fetch` per test)
+  wpt-runner/      classic testharness and opt-in screenshot reftest profiles
   triage/          groups WPT failures into root causes; tiers.list defines the tiers
   perf-bench/      times `obscura fetch` / `obscura scrape`
 obstacle-course/   modern-web capability + speed fixtures (+ run.py, manifest.json)
@@ -239,8 +270,9 @@ wpt/               the WPT checkout (gitignored; created by setup-wpt.sh)
   `compare/scale.py` uses `psutil` for memory sampling (`pip install psutil`),
   and the compare/realworld harnesses read peak RSS from GNU `time -v`.
 - For the head-to-head, a Chrome or Chromium build (`CHROME_BIN`).
-- For WPT, the one-time `scripts/setup-wpt.sh` (clones WPT, builds the manifest,
-  installs the report overlay) plus the WPT hostnames in `/etc/hosts`.
+- For WPT, the one-time `scripts/setup-wpt.sh` (checks out the pinned WPT commit,
+  builds the manifest, and installs the report overlay) plus the WPT hostnames
+  in `/etc/hosts`.
 
 `results/` and the `wpt/` checkout are gitignored; run artifacts are regenerated
 by the scripts.

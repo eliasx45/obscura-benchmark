@@ -18,3 +18,5 @@ clap.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 futures-util.workspace = true
+base64 = "0.22"
+png = "0.18"

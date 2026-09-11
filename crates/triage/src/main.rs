@@ -11,9 +11,9 @@
 //!       "duration_ms","error","console":[..],"exceptions":[..],
 //!       "subtests":[ {"name","status","message","stack"} ] } ] }
 //!
-//! Subtest status 0 is PASS, anything else is a failure. Harness status 0 is OK,
-//! anything else (including runner codes -1 timeout and -2 error) means the file
-//! itself blew up before its subtests could report.
+//! Subtest status 0 is PASS, anything else is a failure. Harness status 0 is OK;
+//! runner codes -1 and -2 are timeout/error, while -3 is unsupported and is
+//! reported separately rather than counted as a conformance failure.
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -138,6 +138,7 @@ fn parse_report(buf: &str) -> Result<Value> {
 struct Totals {
     files: usize,
     failing_files: usize,
+    unsupported_files: usize,
     failing_subtests: usize,
 }
 
@@ -162,8 +163,20 @@ fn ingest(
 
     for res in results {
         totals.files += 1;
-        let path = res.get("path").and_then(Value::as_str).unwrap_or("<unknown>");
+        let path = res
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown>");
         let spec_area = first_segment(path);
+        let harness_status = res
+            .get("harness_status")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+
+        if harness_status == -3 {
+            totals.unsupported_files += 1;
+            continue;
+        }
 
         // Conformance-tier accounting, using the runner's per-file pass/total/ok.
         {
@@ -181,7 +194,6 @@ fn ingest(
             .and_then(|a| a.iter().find_map(|e| e.as_str()))
             .map(str::to_string);
 
-        let harness_status = res.get("harness_status").and_then(Value::as_i64).unwrap_or(0);
         let mut file_failed = harness_status != 0;
 
         // Subtest-level failures.
@@ -193,7 +205,11 @@ fn ingest(
                 }
                 file_failed = true;
                 totals.failing_subtests += 1;
-                let name = sub.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+                let name = sub
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
                 let message = sub
                     .get("message")
                     .and_then(Value::as_str)
@@ -216,7 +232,11 @@ fn ingest(
                 .get("harness_message")
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
-                .or_else(|| res.get("error").and_then(Value::as_str).filter(|s| !s.is_empty()))
+                .or_else(|| {
+                    res.get("error")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                })
                 .unwrap_or("<harness error>")
                 .to_string();
             records.push(Record {
@@ -554,8 +574,8 @@ fn print_markdown(
         .collect();
 
     println!(
-        "WPT triage: {} files, {} failing files, {} failing subtests.",
-        totals.files, totals.failing_files, totals.failing_subtests
+        "WPT triage: {} files, {} failing files, {} unsupported files, {} failing subtests.",
+        totals.files, totals.failing_files, totals.unsupported_files, totals.failing_subtests
     );
     println!();
 
@@ -653,7 +673,11 @@ fn print_tiers_md(t: &TierTotals) {
         row("(excluded)", &t.excluded, "out of scope, no target");
     }
     if t.other.files > 0 {
-        row("(unclassified)", &t.other, "not yet tiered, extend manifest");
+        row(
+            "(unclassified)",
+            &t.other,
+            "not yet tiered, extend manifest",
+        );
     }
     println!();
 }
@@ -734,6 +758,7 @@ fn print_json(
         "totals": {
             "files": totals.files,
             "failing_files": totals.failing_files,
+            "unsupported_files": totals.unsupported_files,
             "failing_subtests": totals.failing_subtests,
         },
         "tiers": {
@@ -747,4 +772,38 @@ fn print_json(
         "by_area": by_area_json,
     });
     println!("{}", serde_json::to_string_pretty(&out).unwrap());
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn unsupported_files_are_not_counted_as_failures_or_tier_results() {
+        let report = json!({"results": [{
+            "path": "css/example.html",
+            "harness_status": -3,
+            "ok": false,
+            "pass": 0,
+            "total": 0
+        }]});
+        let mut records = Vec::new();
+        let mut totals = Totals::default();
+        let mut tiers = TierTotals::default();
+        ingest(
+            &report,
+            &mut records,
+            &mut totals,
+            &Tiers::load(),
+            &mut tiers,
+        );
+
+        assert_eq!(totals.files, 1);
+        assert_eq!(totals.unsupported_files, 1);
+        assert_eq!(totals.failing_files, 0);
+        assert!(records.is_empty());
+        assert_eq!(tiers.full().files, 0);
+    }
 }
