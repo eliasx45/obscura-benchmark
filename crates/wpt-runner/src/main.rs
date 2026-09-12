@@ -1,5 +1,4 @@
-//! WPT runner: runs classic testharness tests through `obscura fetch` and,
-//! optionally, testharness plus screenshot reftests through Obscura's CDP.
+//! WPT runner: runs classic testharness tests through `obscura fetch` or CDP.
 //!
 //! Work is divided into round-robin buckets. Fetch workers spawn isolated CLI
 //! processes; CDP workers reuse one connection while giving every test its own
@@ -9,50 +8,30 @@ mod capture;
 mod cdp;
 mod fetch;
 mod manifest;
-mod reftest;
 mod report;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use serde_json::{json, Value};
 
 use cdp::Cdp;
-use manifest::{load_tests, TestCase, TestType, UrlBuilder};
-use report::{print_results, summarize, Comparison, FileResult};
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-enum Profile {
-    NoRender,
-    Render,
-}
-
-impl Profile {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::NoRender => "no-render",
-            Self::Render => "render",
-        }
-    }
-}
+use manifest::{load_tests, TestCase, UrlBuilder};
+use report::{print_results, summarize, FileResult};
 
 #[derive(Parser)]
 #[command(
     name = "wpt-runner",
-    about = "Run the Web Platform Tests against Obscura over CDP."
+    about = "Run classic Web Platform Tests against Obscura."
 )]
 struct Args {
     /// Substring filter on the test path.
     filter: Option<String>,
 
-    /// Obscura build profile. Render adds reftests to the classic testharness suite.
-    #[arg(long, value_enum, default_value_t = Profile::NoRender)]
-    profile: Profile,
-
     /// Execution backend. "fetch" runs one `obscura fetch` process per test;
-    /// "cdp" drives a running `obscura serve` and is required for reftests.
+    /// "cdp" drives a running `obscura serve`.
     #[arg(long, default_value = "fetch")]
     backend: String,
     /// Path to the obscura binary used by the fetch backend.
@@ -94,7 +73,7 @@ struct Args {
     #[arg(long, default_value_t = false)]
     include_https: bool,
 
-    /// Number of parallel workers (each with its own CDP connection).
+    /// Number of parallel workers.
     #[arg(long, default_value_t = 4)]
     concurrency: usize,
     /// Per-test timeout in milliseconds.
@@ -127,9 +106,6 @@ struct Args {
 async fn main() -> Result<()> {
     let args = Args::parse();
     let use_fetch = args.backend.eq_ignore_ascii_case("fetch");
-    if args.profile == Profile::Render && use_fetch {
-        return Err(anyhow!("the render profile requires --backend cdp"));
-    }
 
     // The CDP backend needs the browser WebSocket; the fetch backend spawns its
     // own processes and needs no running server.
@@ -153,12 +129,7 @@ async fn main() -> Result<()> {
             https_port: args.https_port,
             h2_port: args.h2_port,
         };
-        let mut tests = load_tests(
-            &args.manifest,
-            &base,
-            args.filter.as_deref(),
-            args.profile == Profile::Render,
-        )?;
+        let mut tests = load_tests(&args.manifest, &base, args.filter.as_deref())?;
         if !args.include_https {
             let before = tests.len();
             tests.retain(|t| t.url.starts_with("http://"));
@@ -242,7 +213,6 @@ async fn main() -> Result<()> {
         &all,
         elapsed,
         args.json,
-        args.profile.as_str(),
         &engine_version,
         &args.wpt_revision,
     );
@@ -266,17 +236,14 @@ struct WorkerCfg {
     verbose: bool,
 }
 
-/// Run one worker's slice of the test list on a single CDP connection. If the
-/// connection dies mid-bucket we reconnect once before the next test so a single
-/// crash does not lose the rest of the bucket.
+/// Run one worker's slice of the test list. CDP workers reuse one connection;
+/// if it dies mid-bucket, reconnect before the next test.
 async fn run_bucket(cfg: WorkerCfg, bucket: Vec<TestCase>) -> Vec<FileResult> {
     if cfg.use_fetch {
         let mut results = Vec::with_capacity(bucket.len());
         for tc in &bucket {
             let result = if let Some(reason) = &tc.unsupported_reason {
                 FileResult::unsupported(tc, reason.clone())
-            } else if tc.test_type == TestType::Reftest {
-                FileResult::unsupported(tc, "reftests require the CDP backend".into())
             } else {
                 fetch::run_fetch(&cfg.obscura_bin, tc, timeout_for(&cfg, tc), cfg.wait_secs).await
             };
@@ -305,9 +272,6 @@ async fn run_bucket(cfg: WorkerCfg, bucket: Vec<TestCase>) -> Vec<FileResult> {
         }
         let mut conn_dead = false;
         let result = match conn.as_mut() {
-            Some(c) if tc.test_type == TestType::Reftest => {
-                run_reftest(c, &cfg, tc, &mut conn_dead).await
-            }
             Some(c) => run_one(c, &cfg, tc, &mut conn_dead).await,
             None => Err(anyhow!("no CDP connection")),
         };
@@ -487,203 +451,4 @@ async fn run_one(
     }
 
     Ok(result)
-}
-
-async fn run_reftest(
-    conn: &mut Cdp,
-    cfg: &WorkerCfg,
-    tc: &TestCase,
-    conn_dead: &mut bool,
-) -> Result<FileResult> {
-    let start = Instant::now();
-    let test_png = capture_png(conn, cfg, tc, &tc.url, conn_dead).await?;
-    let mut comparisons = Vec::with_capacity(tc.references.len());
-    for reference in &tc.references {
-        if reference.relation != "==" && reference.relation != "!=" {
-            return Err(anyhow!("unknown reftest relation `{}`", reference.relation));
-        }
-        let reference_png = capture_png(conn, cfg, tc, &reference.url, conn_dead).await?;
-        let difference = reftest::compare_screenshots(&test_png, &reference_png, reference.fuzzy)?;
-        let passed = if reference.relation == "==" {
-            difference.equal
-        } else {
-            !difference.equal
-        };
-        comparisons.push(Comparison {
-            reference: reference.url.clone(),
-            relation: reference.relation.clone(),
-            fuzzy: reference.fuzzy,
-            equal: difference.equal,
-            max_difference: difference.max_difference,
-            different_pixels: difference.different_pixels,
-            passed,
-        });
-    }
-
-    let matches = comparisons
-        .iter()
-        .filter(|comparison| comparison.relation == "==");
-    let has_match = matches.clone().next().is_some();
-    let passed = (!has_match || matches.clone().any(|comparison| comparison.passed))
-        && comparisons
-            .iter()
-            .filter(|comparison| comparison.relation == "!=")
-            .all(|comparison| comparison.passed);
-    let mut result = FileResult::reftest(tc, passed, comparisons);
-    result.duration_ms = start.elapsed().as_millis() as u64;
-    Ok(result)
-}
-
-async fn capture_png(
-    conn: &mut Cdp,
-    cfg: &WorkerCfg,
-    tc: &TestCase,
-    url: &str,
-    conn_dead: &mut bool,
-) -> Result<String> {
-    use tokio::time::timeout;
-
-    let budget = timeout_for(cfg, tc);
-    let deadline = Instant::now() + budget;
-    let ctrl_cap = budget.min(Duration::from_secs(10));
-    let created = match timeout(
-        ctrl_cap,
-        conn.call("Target.createTarget", json!({ "url": "about:blank" })),
-    )
-    .await
-    {
-        Ok(result) => result?,
-        Err(_) => {
-            *conn_dead = true;
-            return Err(anyhow!("Target.createTarget timed out"));
-        }
-    };
-    let target_id = created
-        .pointer("/targetId")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("Target.createTarget returned no targetId"))?
-        .to_string();
-    let session = format!("{target_id}-session");
-    let _ = timeout(ctrl_cap, conn.enable_capture(&session)).await;
-
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    match timeout(
-        remaining,
-        conn.call_session(
-            &session,
-            "Emulation.setDeviceMetricsOverride",
-            json!({
-                "width": 800,
-                "height": 600,
-                "deviceScaleFactor": 1,
-                "mobile": false
-            }),
-        ),
-    )
-    .await
-    {
-        Ok(result) => {
-            result?;
-        }
-        Err(_) => {
-            *conn_dead = true;
-            return Err(anyhow!("Emulation.setDeviceMetricsOverride timed out"));
-        }
-    }
-
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    match timeout(
-        remaining,
-        conn.call_session(&session, "Page.navigate", json!({ "url": url })),
-    )
-    .await
-    {
-        Ok(result) => {
-            result?;
-        }
-        Err(_) => {
-            *conn_dead = true;
-            return Err(anyhow!("Page.navigate timed out"));
-        }
-    }
-
-    const READY: &str = r#"
-        (async function () {
-          if (document.readyState !== "complete") {
-            await new Promise(function (resolve) {
-              addEventListener("load", resolve, { once: true });
-            });
-          }
-          if (document.fonts && document.fonts.ready) await document.fonts.ready;
-          var root = document.documentElement;
-          if (root && root.classList.contains("reftest-wait")) {
-            root.dispatchEvent(new Event("TestRendered", { bubbles: true }));
-            await new Promise(function (resolve) {
-              var timer = setInterval(function () {
-                if (!root.classList.contains("reftest-wait")) {
-                  clearInterval(timer);
-                  resolve();
-                }
-              }, 10);
-            });
-          }
-          await new Promise(function (resolve) {
-            if (typeof requestAnimationFrame !== "function") return setTimeout(resolve, 0);
-            requestAnimationFrame(function () { requestAnimationFrame(resolve); });
-          });
-          return true;
-        })()
-    "#;
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    let evaluated = match timeout(
-        remaining,
-        conn.call_session(
-            &session,
-            "Runtime.evaluate",
-            json!({ "expression": READY, "awaitPromise": true, "returnByValue": true }),
-        ),
-    )
-    .await
-    {
-        Ok(result) => result?,
-        Err(_) => {
-            *conn_dead = true;
-            return Err(anyhow!("reftest readiness timed out"));
-        }
-    };
-    if let Some(exception) = evaluated.get("exceptionDetails") {
-        return Err(anyhow!("reftest readiness failed: {exception}"));
-    }
-
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    let captured = match timeout(
-        remaining,
-        conn.call_session(
-            &session,
-            "Page.captureScreenshot",
-            json!({ "format": "png", "fromSurface": true, "captureBeyondViewport": false }),
-        ),
-    )
-    .await
-    {
-        Ok(result) => result?,
-        Err(_) => {
-            *conn_dead = true;
-            return Err(anyhow!("Page.captureScreenshot timed out"));
-        }
-    };
-    let data = captured
-        .get("data")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("Page.captureScreenshot returned no data"))?
-        .to_string();
-
-    if !*conn_dead {
-        let _ = timeout(
-            ctrl_cap,
-            conn.call("Target.closeTarget", json!({ "targetId": target_id })),
-        )
-        .await;
-    }
-    Ok(data)
 }

@@ -1,6 +1,6 @@
 //! Fetch backend: run one `obscura fetch` process per test.
 //!
-//! The no-render profile drives one isolated process per test and reads the
+//! The classic WPT runner drives one isolated process per test and reads the
 //! result the report overlay leaves on `window.__wptresults_json`.
 
 use std::time::{Duration, Instant};
