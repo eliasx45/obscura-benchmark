@@ -3,11 +3,10 @@
 //! testharness.js uses harness status 0 for OK and 1..3 for failures. Runner
 //! statuses are -1 timeout, -2 error, and -3 explicitly unsupported.
 
-use serde::Serialize;
 use serde_json::{json, Value};
 use std::time::Duration;
 
-use crate::manifest::{Fuzzy, TestCase, TestType};
+use crate::manifest::TestCase;
 
 pub struct Subtest {
     pub name: String,
@@ -16,26 +15,13 @@ pub struct Subtest {
     pub stack: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
-pub struct Comparison {
-    pub reference: String,
-    pub relation: String,
-    pub fuzzy: Fuzzy,
-    pub equal: bool,
-    pub max_difference: u64,
-    pub different_pixels: u64,
-    pub passed: bool,
-}
-
 pub struct FileResult {
-    pub test_type: TestType,
     pub path: String,
     pub url: String,
     pub harness_status: i64,
     pub harness_message: Option<String>,
     pub error: Option<String>,
     pub subtests: Vec<Subtest>,
-    pub comparisons: Vec<Comparison>,
     pub console: Vec<String>,
     pub exceptions: Vec<String>,
     pub duration_ms: u64,
@@ -77,26 +63,16 @@ impl FileResult {
             })
             .unwrap_or_default();
         Self {
-            test_type: tc.test_type,
             path: tc.path.clone(),
             url: tc.url.clone(),
             harness_status,
             harness_message,
             error: None,
             subtests,
-            comparisons: Vec::new(),
             console: Vec::new(),
             exceptions: Vec::new(),
             duration_ms: 0,
         }
-    }
-
-    pub fn reftest(tc: &TestCase, passed: bool, comparisons: Vec<Comparison>) -> Self {
-        let mut result = Self::stub(tc, if passed { 0 } else { 1 }, "");
-        result.harness_message =
-            (!passed).then(|| "rendered output did not satisfy references".into());
-        result.comparisons = comparisons;
-        result
     }
 
     pub fn timeout(tc: &TestCase) -> Self {
@@ -115,14 +91,12 @@ impl FileResult {
 
     fn stub(tc: &TestCase, harness_status: i64, error: &str) -> Self {
         Self {
-            test_type: tc.test_type,
             path: tc.path.clone(),
             url: tc.url.clone(),
             harness_status,
             harness_message: None,
             error: (!error.is_empty()).then(|| error.to_string()),
             subtests: Vec::new(),
-            comparisons: Vec::new(),
             console: Vec::new(),
             exceptions: Vec::new(),
             duration_ms: 0,
@@ -160,15 +134,6 @@ impl FileResult {
     }
 
     pub fn line(&self) -> String {
-        if self.test_type == TestType::Reftest {
-            return format!(
-                "{} {:>4}/{:<4} {}",
-                self.tag(),
-                usize::from(self.ok()),
-                1,
-                self.path
-            );
-        }
         format!(
             "{} {:>4}/{:<4} {}",
             self.tag(),
@@ -180,7 +145,7 @@ impl FileResult {
 
     fn to_json(&self) -> Value {
         json!({
-            "type": self.test_type.as_str(),
+            "type": "testharness",
             "path": self.path,
             "url": self.url,
             "harness_status": self.harness_status,
@@ -192,7 +157,6 @@ impl FileResult {
             "error": self.error,
             "console": self.console,
             "exceptions": self.exceptions,
-            "comparisons": self.comparisons,
             "subtests": self.subtests.iter().map(|test| json!({
                 "name": test.name,
                 "status": test.status,
@@ -243,7 +207,6 @@ pub fn print_results(
     results: &[FileResult],
     elapsed: Duration,
     as_json: bool,
-    profile: &str,
     engine_version: &str,
     wpt_revision: &str,
 ) {
@@ -251,7 +214,7 @@ pub fn print_results(
     if as_json {
         let output = json!({
             "schema_version": 2,
-            "profile": profile,
+            "profile": "no-render",
             "engine_version": engine_version,
             "wpt_revision": wpt_revision,
             "elapsed_ms": elapsed.as_millis() as u64,

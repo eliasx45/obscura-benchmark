@@ -5,8 +5,10 @@
 # the WPT checkout is large and reproducible from setup-wpt.sh
 /wpt
 
-# generated run artifacts
-/results
+# generated run artifacts; reviewed baselines are explicitly published
+/results/*
+!/results/published/
+!/results/published/**
 
 # logs
 *.log
